@@ -7,3 +7,5 @@ Le [notebook est aussi disponible sur Kaggle Kernel](https://www.kaggle.com/arif
 Pour pouvoir lancer le TD à partir des données sans erreur il faut créer un projet qui contient un dossier **data_text_mining** dans lequel vous placerez tous les fichiers de données contenus dans le zip télécharger sur Kaggle ou sur weTransfer.
 
 Ensuite ouvrir le projet et le script td_tm_debug.Rmd => tout devrait fonctionner.
+
+Le rendu HTML est disponible à cette adresse : [https://phileas-condemine.github.io/formation_TM/](https://phileas-condemine.github.io/formation_TM/)
