@@ -1433,14 +1433,18 @@ Attention pour l'installation, le package n'est pas sur CRAN
 devtools::install_github("bmschmidt/wordVectors")
 ```
 
+Les données peuvent être téléchargées [ici](http://embeddings.net/frWac_non_lem_no_postag_no_phrase_200_cbow_cut100.bin)
+
 On charge le modèle, c'est un peu long...
 
 ```{r, results='hide', message=FALSE, warning=FALSE, eval=F}
 library(wordVectors)
 library(magrittr)
+#A télécharger ici http://embeddings.net/frWac_non_lem_no_postag_no_phrase_200_cbow_cut100.bin
 model = read.vectors("data_text_mining/frWac_non_lem_no_postag_no_phrase_200_cbow_cut100.bin")
 ```
 
+On peut explorer cet embedding grâce aux fonctions du package illustrée dans ce [tutoriel](https://github.com/bmschmidt/wordVectors/blob/master/vignettes/introduction.Rmd)
 
 ```{r, eval=F}
 model %>% closest_to("economie") # montre les mots les plus proche de economie dans cet espace

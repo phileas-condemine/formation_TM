@@ -9,3 +9,5 @@ Pour pouvoir lancer le TD à partir des données sans erreur il faut créer un p
 Ensuite ouvrir le projet et le script td_tm_debug.Rmd => tout devrait fonctionner.
 
 Le rendu HTML est disponible à cette adresse : [https://phileas-condemine.github.io/formation_TM/](https://phileas-condemine.github.io/formation_TM/)
+
+Pour la **maintenance** de cette Github Page, ici suffit de *knitter* le Rmd dans RStudio => récupérer le html et le renommer en index.html, il doit être placé à la racine du repo => add/commit/push et la page est mise à jour.
