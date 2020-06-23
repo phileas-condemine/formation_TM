@@ -743,6 +743,12 @@ Pour des questions de temps de calcul, on a choisi des grilles de recherche trè
 <!-- execute(commands = c("supervised", "-input", train_tmp_file_txt, "-output", tmp_file_model, "-dim", 20, "-lr", 1, "-epoch", 20, "-wordNgrams", 2, "-verbose", 1)) -->
 <!-- ``` -->
 
+#### Exercices libres - garder au moins 1h30 pour la suite
+
+Réaliser l'exercice de classification sur l'échantillon complet (113k observations labellisées) en appliquant les techniques vues en cours de Gradient Boosting & SVM : XGBoost et SVM-LIBLinear. 
+
+Si vous êtes très en avance, essayer l'algorithme [fastText](https://fasttext.cc/docs/en/supervised-tutorial.html) sur le jeu de données complet, on pourra s'appuyer sur le package fastrtext. Comparer avec les résultats obtenus par XGBoost & LIBLinear.
+
 
 ### Classification non supervisée
 
@@ -976,6 +982,27 @@ doc_lda_cluster=posterior(ldaOut)$topics
 # doc_lda_cluster=ldaOut@gamma
 apply(doc_lda_cluster,2,function(x)sum(x*target)/sum(x))
 ```
+
+
+### Exercices libres
+
+Réaliser une réduction de dimension par LSA et (avec ou sans SVD préalable) tSNE ou umap en dimension 2. Parvient-on à séparer visuellement les documents traitant d'économie ?
+
+En dimension réduite, appliquer les techniques classiques de clustering : kmeans, kmedoids, dbscan et comparer aux résultats précédents.
+
+### Conclusion
+
+On a vu comment appliquer les techniques de préparation du texte en vue d'une classification supervisée ou non-supervisée à partir d'une représentation des données en sacs-de-mots. 
+
+Les techniques à l'"état de l'art" de transfert d'apprentissage s'appuient sur un réseau de neurone pré-entraîné sur un corpus gigantesque puis spécialisé sur un corpus "métier" pour une tâche simple telle que notre distinction entre les articles d'économie et les autres.
+
+Dans notre cas (langue française) on pourrait s'appuyer sur les modèles [FlauBERT](https://huggingface.co/transformers/model_doc/flaubert.html) ou [CamemBERT](https://huggingface.co/transformers/model_doc/camembert.html) mais ce n'est pas faisable facilement en R pour l'instant, [voici une piste](https://blogs.rstudio.com/ai/posts/2019-09-30-bert-r/) qui utilise le package reticulate.
+
+Dans la suite du TD on revient rapidement sur des techniques mentionnées dans le cours :
+
+- Matching de chaînes de caractères
+- Analyse sémantique à partir d'un dictionnaire annoté
+- Vectorisation du vocabulaire avec word2vec ou GloVe
 
 
 
