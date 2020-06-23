@@ -1,0 +1,1442 @@
+---
+title: "Formation analyse textuelle"
+author: 
+- Stéphanie Combes
+- Philéas Condemine
+date: "lundi 23 juin 2020"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    toc_depth: 4
+---
+
+
+# Données textuelles et machine learning  
+
+Dans le cadre d'une étude, on a récupéré les contenus des articles publiés sur le site du monde.fr, l'objectif initial était de construire un indicateur de sentiment média reflétant la santé de l'économie en temps réel (à l'instar de l'indicateur de climat des affaires produit par l'Insee à partir d'enquêtes réalisées auprès des chefs d'entreprises dans le cadre desquelles ils sont interrogés sur leur sentiment relatif à la conjoncture dans leur secteur, ainsi que l'évolution de leurs ventes passées, carnets de commande ou encore effectifs...).
+
+Dans ce contexte, nous avons donc cherché dans un premier temps à isoler les articles traitant d'économie, ce qui est possible, sur la période récente (à partir de 2005 par les métadata associées aux articles et qui comprennent notamment leur classement en différentes thématiques : culture, sport, économie...), les articles plus vieux ne sont en revanche pas catégorisés. Nous avons donc décidé d'entraîner un algorithme sur la période récente, pour laquelle la catégorisation existe, et de l'appliquer pour classer les articles publiés avant 2005. L'exercice proposé reproduit la méthode sur un extrait des articles manipulés dans l'étude.
+
+On est donc en présence d'un problème de classification supervisée binaire
+
+### Introduction
+
+#### Chargement des données 
+
+Pour commencer, afin que les calculs tournent vite et qu'on puisse relancer facilement en cas de plantage, on travaille sur 500 documents mais le fichier en contient 10k, si votre PC est assez puissant, vous pouvez travailler sur les 10k documents directement.
+
+```{r message=FALSE, warning=FALSE}
+library(magrittr)
+library(data.table)
+
+data <- read.csv('data_text_mining/lemonde_csv_formation.csv', sep=';',header = TRUE, nrows=500, encoding = "UTF-8",stringsAsFactors = F)
+names(data)
+dim(data)
+# fread("data_text_mining/lemonde_formation_tm.csv")
+data[1,]
+```
+
+Pour obtenir de meilleurs résultats sur le modèle de prédiction, **on pourra relancer le TD** (sauf wordcloud et autres dataviz qui risquent d'être un peu longues à calculer) sur ce jeu de données plus complet avec ~10k documents par an => 395k documents ie 113k articles post-2005 qui sont donc classés dans un ensemble de catégories dont (top 10 décroissant) : planète, afrique, sport, idées, culture, international, europe, politique, societe, economie. On s'intéresse ici seulement à "économie *versus* le reste".
+
+```{r eval=F}
+load("lemonde_scraping_10k_per_annee.RData")
+names(scrape_dt)
+sub_href = gsub("https://www.lemonde.fr/","",scrape_dt$href)
+category = stringr::str_extract(sub_href,"^[A-z]+/")
+category = gsub("/","",category)
+table(category)
+scrape_dt$category = category
+scrape_dt$href = NULL
+setnames(scrape_dt,c("abstract"),c("content"))
+data = scrape_dt
+rm(scrape_dt)
+sum(is.na(data$category))
+data = data[category!="archives"&!is.na(category)]
+my_samp = c(sample(which(data$category=="economie"),2000),sample(which(data$category!="economie"),3000))
+data=data[my_samp]
+tail(sort(table(data$category)),10)
+
+```
+
+#### Scraping
+
+Donnez-vous 15 minutes pour essayer de récupérer vous même les articles sur le site du monde [https://www.lemonde.fr](https://www.lemonde.fr)
+
+Pour comprendre comment on a récupéré les données vous pouvez executer le code ci-dessous.
+
+Pour comprendre la logique vous aurez besoin d'ouvrir l'URL dans votre navigateur préféré et inspecter un élément pour comprendre ce que représente la balise `articles`
+
+
+```{r eval=F}
+library(rvest)
+library(data.table)
+annees=1980:2019
+annee = sample(annees,1)
+i = sample(1:250,1)
+pbapply::pblapply(annees,function(annee){
+  pbapply::pblapply(1:250,function(i){
+    try({
+      url = sprintf(paste0("https://www.lemonde.fr/recherche/",
+                           "?search_keywords=a&start_at=01/01/%s&",
+                           "end_at=31/12/%s&search_sort=relevance_desc&page=%s"),annee,annee,i)
+      page = rvest::html_session(url)
+      href = page%>%html_nodes("section.teaser")%>%html_node("a")%>%html_attr("href")
+      title = page%>%html_nodes("section.teaser")%>%html_node("h3")%>%html_text()
+      abstract = page%>%html_nodes("section.teaser")%>%html_node("p")%>%html_text()
+      date = page%>%html_nodes("section.teaser")%>%html_node("span.meta__date")%>%html_text()
+      data = data.frame(href=href,title=title,abstract=abstract,date=date,stringsAsFactors = F)
+      save(data,file=paste0("lemonde_scraping/a_",annee,"_",i,".RData"))
+    })
+  })
+})
+
+
+files = list.files("lemonde_scraping/")
+
+annees = table(substr(files,3,6))
+annees = names(annees[annees==250])
+
+grid =expand.grid(annee=as.numeric(annees),nb=1:250,stringsAsFactors = F)
+scrape = pbapply::pbapply(grid,1,function(x){
+  print(x)
+  load(paste0("lemonde_scraping/a_",x[1],"_",x[2],".RData"))
+  data
+})
+scrape_dt = rbindlist(scrape)
+scrape_dt=unique(scrape_dt)
+
+save(scrape_dt,file="lemonde_scraping_10k_per_annee.RData")
+```
+
+
+
+
+#### Intuition
+
+On va chercher à utiliser le contenu des articles pour identifier la catégorie des articles. Regardons déjà les catégories existantes et leur fréquence :
+
+```{r message=FALSE, warning=FALSE}
+table(data$category)
+table(data$category)/sum(table(data$category))
+```
+
+Pour voir si notre intuition a de bonnes chances de se vérifier on commence par produire des nuages de mots par catégorie. On commence par la catégorie culture, on concatène tous les articles de cette catégorie avec `paste` et on applique la fonction `wordcloud` qui génére le nuage de mots (remarque c'est une datavisualisation classique et sympathique pour le texte, mais on aurait pu se contenter d'un diagramme en barres !)
+
+On commence tout d'abord par concaténer les titres et contenus, car l'information des titres peut s'avérer particulièrement discriminante
+
+```{r message=FALSE, warning=FALSE}
+data$title <- as.character(data$title)
+data$content <- as.character(data$content)
+# data$txt <- sapply(1:nrow(data),function(i) paste(data[i,c('title','content')],collapse=' '))# approche non-vectorielle maladroite.
+data$txt=paste(data$title,data$content)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(tm)
+#require(devtools) #decommenter pour installer wordcloud2
+#install_github("lchiffon/wordcloud2")
+library(wordcloud2)
+
+#preparation des données pour le nuage de mots
+words <- paste(data[data$category=='culture','txt'],collapse=' ') # on concatene tout le texte 
+wordsFreq <- data.frame(sort(table(strsplit(words,"\\s+")),decreasing=TRUE)) # on compte chaque mot, le motif entre guillemet veut dire qu'on coupe la chaine de caractère quelque soit le nombre d'espaces entre les mots
+head(wordsFreq)
+
+wordcloud2(data = wordsFreq[1:500,],minSize = 5, size = 3)
+
+#library(wordcloud)  # ce package permet la creation de wordcloud plus immediatement mais provoque des problemes a l'affichage souvent
+#wordcloud(words = paste(data[data$category=='culture','txt'],collapse=' '),max.words=500, random.order=FALSE, rot.per=0.35, colors=brewer.pal(8, "Dark2"),scale = c(8, 0.5), family = "serif", font = 3)
+```
+
+
+On voit ressortir theatre, cinema, festival mais on a quand même un certain bruit qui nous empêche de conclure clairement ici avec des mots très présents mais non discriminatoires comme 'les', 'des', 'une'... En fait, en analyse textuelle, il est classique de d'abord nettoyer et harmoniser le texte, voyons comment.
+
+#### Traitement du texte
+
+Pour normaliser le texte on va utiliser le package `tm` qui automatise une bonne partie des traitements les plus fréquents, on va opérer les transformations classiques suivantes :
+
+- on retire les accents 
+- on retire la ponctuation
+- on réduit la casse afin que les mots avec majuscule ne se distinguent pas de leurs homologues sans majuscule
+- on retire les mots dits "mots outils" (ou stopwords), qui n'apportent rien car ils sont presque toujours présents dans tous les documents
+- on racinise (éventuellement, cela permet de ramener des mots ayant la même racine à une forme commune, par exemple "économie", "économiste" deviendrait "économ")
+- on retire les espaces en trop
+
+Pour cela on commence par transformer le texte en corpus.
+
+```{r}
+library(tm)
+documents <- Corpus(VectorSource(data$txt))
+documents[1]$content
+getTransformations() #transformations disponibles
+```
+
+On peut ensuite appliquer les différents traitements successivement.
+
+
+Important, sur corpus en français, en général on retire les accents qui pourraient poser des problèmes par la suite
+
+```{r}
+library(stringi)
+library(stringr)
+accent <- function(x) stri_trans_general(x, "Latin-ASCII") # cela signifie qu'on remplace un caractère encodé en Latin1 par son équivalent le plus proche en ASCII, il n'y a par exemple pas de caractères accentués en ASCII
+documents <- tm_map(documents, content_transformer(accent))
+documents[1]$content
+```
+
+On retire la ponctuation et les nombres, ce qui revient à ne garder que ce qui est une lettre, pour cela on fait une opération de remplacement en s'appuyant sur les expressions régulières qui sont une manière de décrire des "motifs", ici `[^a-z]` signifie : tout ce qui n'est pas du texte (fonctionne ici car on a retiré les accents, si on veut conserver les accents on peut utiliser la fonction `removePunctuation` de `tm` mais elle n'est pas exhaustive, elle ne traite pas l'apostrophe par exemple).
+
+```{r}
+documents <- tm_map(documents, content_transformer(gsub), pattern = "[^a-zA-Z]", replacement = " ")
+documents[1]$content
+```
+
+On peut réduire la casse pour avoir une casse harmonisée.(Rq : cette étape et la précédente peuvent être interverties, il faut simplement le prendre en considération dans l'expression régulière précédente)
+
+```{r}
+documents <- tm_map(documents, content_transformer(tolower))
+documents[1]$content
+```
+
+A présent on va retirer les mots outils, la plupart des librairies possèdent des listes pré construites...
+Comme on a enlevé les accents avant on enlève les accents des stopword (ne pas le faire si on a décidé de conserver les accents).
+
+```{r}
+stopwords_fr <- sapply(stopwords("french"),accent)
+stopwords_fr
+documents2 <- tm_map(documents, removeWords, stopwords_fr)
+documents2[1]$content
+
+rm(documents2)
+```
+
+Mais on peut vouloir personnaliser la liste, pour les articles de journaux par exemple, on va rajouter les indicateurs de temps qui n'apportent pas d'information dans notre cas d'usage.
+
+```{r}
+stopwords_fr = c(stopwords_fr,'a','h','lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche','etre','apres','selon','comme','alors','tout','tous','faire','depuis','encore')
+stopwords_fr = setdiff(stopwords_fr, c("pas")) # 'pas' est inclus dans les stopword, on trouve que c'est un peu dommage alors on le retire de la liste
+documents <- tm_map(documents, removeWords, stopwords_fr)
+documents[1]$content
+```
+
+Enfin, on peut souhaiter raciniser, on utilise pour cela la librairie `SnowballC` qui implémente l'algorithme de Porter.
+
+```{r}
+library('SnowballC')
+documents_nonstem <- documents
+documents <- tm_map(documents, stemDocument, "french")
+documents[1]$content
+# stemCompletion(,dictionary=documents_nonstem)  #remarque le stemming fait perdre la lisibilite, on peut la retrouver avec stemCompletion 
+```
+
+Reste à nettoyer tous les espaces rajoutés par les opérations précédentes (il n'y en a pas forcément mais ça permet de s'en assurer).
+
+```{r}
+documents <- tm_map(documents, stripWhitespace) #n'enleve pas le tout premier espace
+documents <- tm_map(documents, content_transformer(gsub), pattern = "^\\s+", replacement = "")
+documents[1]$content
+```
+
+
+
+Wordcloud sur le texte préparé
+
+```{r}
+
+new_text=sapply(documents,identity)
+new_text=paste(new_text,collapse=" ")
+wordsFreq <- data.frame(sort(table(strsplit(new_text,"\\s+")),decreasing=TRUE))
+wordcloud2(data = wordsFreq[1:500,],minSize = 5, size = 3)
+
+```
+
+On peut désormais vectoriser le texte, ie construire la matrice pour laquelle chaque ligne correspond à une article et chaque colonne à un mot de vocabulaire (le vocabulaire étant le nombre total de mots distincts utilisés au moins une fois dans le corpus). Les coordonnées i,j de la matrice valent 0 si le mot j n'est pas dans le document i ou son occurrence sinon. Cette objet est facilement manipulable par la suite
+
+
+
+
+`stemCompletion` permet de compléter les mots "racinisés" par un "vrai" mot. On choisira pour cela le mot le plus fréquent.
+
+
+si **cheveux**, **chevaux**, **cheval** donnent **chev** et qu'ils ont présents respectivement 10, 50 et 3 fois dans le corpus, alors on remplacera tous les chev par chevaux (le plus fréquent).
+
+```{r}
+dtm <- DocumentTermMatrix(documents)
+dim(dtm)
+
+# x <- x %>% f # la syntaxe que vous connaissez...
+# x %<>% f # une syntaxe alternative 
+
+dimnames(dtm)$Terms %<>% stemCompletion(documents_nonstem)
+
+```
+
+Le nombre de colonnes correspond à la taille du vocabulaire. Les dimensions de cette matrice peuvent être très importantes, ce qui peut poser des problèmes de mémoire en R. On retire les mots trop rares.
+
+On en profite aussi pour calculer les pondérations `tfidf` qui sont des pondérations classiques pour le texte (pondère beaucoup les mots qui apparaissent souvent dans un document mais rarement dans le corpus pris globalement, ça a particulièrement du sens pour les documents longs, pas pour des tweets typiquement).
+
+
+```{r}
+minfreq <- findFreqTerms(dtm, 30) # minfreq réduit le vocabulaire, au lieu de prendre les mots apparaissant au moins une fois, on prend le nombre de mots apparaissant au moins 30 fois afin de limiter un peu le nombre de colonnes avant meme de calculer la matrice. 30 est choisi arbitrairement, mais rappelez vous que le vocabulaire représente des dizaines de milliers de mots sur des centaines de milliers d'articles, 30 semble donc légitimement faible.
+dtm <- DocumentTermMatrix(documents, control=list(dictionary = minfreq, weighting=weightTfIdf)) #ici on choisit tfidf car les documents sont longs mais ce n'est pas sur ce critère qu'on réduit la dimension. On pourrait le faire mais pour cela il faudrait calculer la somme par colonne des pondérations tf idf dans dtm, puis retirer les colonnes pour lesquelles cette somme est inférieure à un certain seuil. On peut aussi réduire la dimension après avec la fonction removeSparseTerms de tm (un exemple est donné plus loin)
+dim(dtm)
+```
+
+Desormais on peut refaire les wordclouds :
+
+```{r message=FALSE, warning=FALSE}
+categories <- levels(data$category)
+dtm_m <- as.matrix(dtm)
+for (i in 1:length(categories)){
+  m <- dtm_m[data$category==categories[i],]
+  wordsFreq <- sort(colSums(m),decreasing = TRUE)
+  wordsFreq <- data.frame(word = names(wordsFreq), Freq = as.vector(wordsFreq)) # mise au format pour wordcloud2
+  print(wordcloud2(data = wordsFreq[1:500,],minSize = 1, size = 3))
+  }
+
+  #d <- data.frame(freq = sort(colSums(m),decreasing=TRUE)) #frequence d'apparition des mots  
+  #wordcloud(words = rownames(d), freq = d$freq, min.freq = 1,max.words=500, random.order=FALSE, rot.per=0.35, colors=brewer.pal(8, "Dark2"),scale = c(8, 0.1),vfont=c("serif","plain"))}
+```
+
+On peut également faire toutes sortes de statistiques basiques comme regarder la distribution du nombre de mots dans les articles (remarque ici ce n'est pas tout à fait le nombre de mots puisqu'on a pris la pondération tfidf) :
+
+```{r message=FALSE, warning=FALSE}
+counts <- rowSums(dtm_m) # somme des tf-idf par document
+# counts <- stri_count_words(data$content) # si on voulait compter le nombre de mots par document
+hist(counts,breaks=50)
+summary(counts)
+```
+
+Ou encore étudier les similarités entre mot (et donc le contexte dans lequel un mot est employé) 
+
+```{r message=FALSE, warning=FALSE}
+findAssocs(dtm, terms = "etat", corlimit = 0.1)
+# le code est là : https://github.com/cran/tm/blob/f89370e43887dc62fd14627bc50f6ca90a1c5e0e/R/matrix.R
+cosine=crossprod(dtm_m)
+normalisation=1/sqrt(diag(cosine))
+cosine = cosine * normalisation
+cosine = t(cosine) * normalisation
+# l'écart vient probablement de la différence d'implémentation de l'estimateur de la corrélation dans cor.
+
+cosine[1:3,1:3]
+
+sort(cosine[,"etat"],decreasing=T)%>%head(10)
+
+```
+
+
+Finalement, il faut aussi noter, qu'en nettoyant le texte, quelque part on a retiré plein de mots inutiles et ainsi réduit la dimension, mais parfois au contraire on va l'augmenter en incorporant les combinaisons de mots adjacents. 
+
+
+```{r message=FALSE, warning=FALSE}
+library(RWeka)
+BigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2)) #pour garder les unigrammes on peut changer min en 1
+
+# uni_triTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 1, max = 3))
+tdm_b <- TermDocumentMatrix(VCorpus(VectorSource(documents$content)), control = list(tokenize = BigramTokenizer)) #attention en raison d'une incompatibilite de NgramTokenizer avec la nouvelle version de tm pour la fonction Corpus mais pas VCorpus on convertit l'un dans l'autre juste pour cette opération
+dim(tdm_b)
+m <- as.matrix(tdm_b)
+v <- sort(rowSums(m),decreasing=TRUE)
+d <- data.frame(freq = v)
+head(d)
+
+
+
+```
+
+
+#### Orthographe
+
+Ici on a la chance d'avoir un corpus sans faute. Si ce n'était pas le cas, on pourrait tenter de corriger le corpus à l'aide d'un dictionnaire. La librairie hunspell fait le lien avec un dictionnaire installé sur l'ordinateur. Il faut également préciser un dictionnaire de langue française. ATTENTION au chemin.
+
+```{r message=FALSE, warning=FALSE}
+library(hunspell)
+words <- c("parfois", "ortographe")
+hunspell_check(words) # par défaut c'est un dictionnaire anglais
+```
+
+On peut "facilement" trouver des dictionnaires pour la plupart des langues : https://cran.r-project.org/web/packages/hunspell/vignettes/intro.html#setting_a_language
+Plus spécifiquement, pour le français on peut trouver des dictionnaires (moderne, classique, post-réforme) ici : https://grammalecte.net/download.php?prj=fr
+
+```{r message=FALSE, warning=FALSE, eval=F}
+bad_words <- hunspell_find("il est parfois interresant de verifier l'orthographe", dict = 'data_text_mining/fr_FR.dic')
+print(bad_words) #là on a précisé le chemin vers les fichiers du dictionnaire francais donc ils trouvent les mots mal orthographiés, rq il prend en compte les accents
+```
+
+On peut prendre le dictionnaire Hunspell français, le lire, supprimer des accents, écrire le fichier sans accent, et faire pointer la fonction hunspell_find() vers ce dictionnaire.
+```{r eval=F}
+fr_dic = readLines("data_text_mining/fr_FR.dic")
+accent <- function(x) stri_trans_general(x, "Latin-ASCII")
+fr_dic_no_accent <- pbapply::pbsapply(fr_dic,accent)
+fr_dic_no_accent <- fr_dic_no_accent %>% unname %>% unique
+writeLines(text = fr_dic_no_accent,con = "data_text_mining/fr_FR_no_accent.dic")
+head(fr_dic_no_accent)
+bad_words <- hunspell_find("il est parfois interresant de verifier l'orthographe", dict = 'data_text_mining/fr_FR_no_accent.dic')
+bad_words
+```
+
+
+### Classification supervisée (binaire)
+
+On rappelle qu'on cherche à distinguer les articles traitant d'économie de tous les autres, on construit donc une nouvelle variable cible binaire : 
+
+```{r message=FALSE, warning=FALSE}
+data$categorybin <- 'autre'
+data$categorybin[data$category == 'economie'] <- 'economie'
+data$categorybin <- as.factor(data$categorybin)
+table(data$categorybin)/sum(table(data$categorybin))
+```
+
+La plupart des modèles choisissent comme classe de positifs, la classe correspondant au premier label, or ici "economie" arrive en second (ordre alphabétique), afin que la lecture des différents scores (précision, rappel, spécificicité, sensibilité) soit cohérente avec la détection des positifs (ici les articles liés à l'économie), on inverse les labels. 
+
+```{r message=FALSE, warning=FALSE}
+head(data$categorybin)
+levels(data$categorybin)
+data$categorybin <- relevel(data$categorybin, "economie")
+head(data$categorybin)
+levels(data$categorybin)
+```
+
+
+Pour tout le protocole de machine learning on utilise la librairie `caret` qui fournit les fonctions pour tout le workflow : construire les échantillons, le prétraitement, les différentes options de validations croisées et un très grand nombre de modèles (https://topepo.github.io/caret/available-models.html).
+Sur cette page on peut aussi voir si les méthodes sont disponibles pour la régression et/ou la classification.
+Un gros effort de standardisation a été fait, avec un grand nombre de fonctions et options communes mais attention toutefois aux petites variantes. 
+
+
+```{r}
+library(caret)
+library(MLmetrics)
+```
+
+#### Train/test sets 
+
+On commence donc par créer un échantillon d'apprentissage et de test stratifié (80% train, 20% test).
+On rappelle que cela sert à vérifier que l'algorithme a de bonnes propriétés de généralisation. S'il sait très bien prédire la catégorie des articles sur lesquels il est estimé, c'est peut-être qu'il est "spécialisé" de ces articles et n'arrivera pas forcément à prédire correctement un article trop différent. Ce qu'on veut c'est qu'il capte les grandes tendances différenciant dans le texte "économie" du reste pour pouvoir classer correctement une majorité d'article. En mettant de côté une partie des articles, on se réserve la possibilité de tester sa capacité à généraliser sur des articles qu'il n'a "jamais vus"
+
+```{r}
+set.seed(1234)
+splitIndex <- createDataPartition(data$categorybin, p = .80, list = FALSE, times = 1)
+data.train <- data.frame(dtm_m[ splitIndex,])
+data.test  <- data.frame(dtm_m[-splitIndex,])
+```
+
+On vérifie les proportions de la cible dans les deux sous échantillons 
+
+```{r}
+ytrain <- data$categorybin[splitIndex]
+ytest  <- data$categorybin[-splitIndex]
+table(ytrain)/sum(table(ytrain))
+table(ytest)/sum(table(ytest))
+```
+
+#### Calcul parallélisé 
+
+Pour permettre la sollicitation des différents coeurs lorsque c'est possible (au minimum pour les opérations de validation croisée) on fait d'abord les opérations suivantes. Les algorithmes de machine learning peuvent être assez consommateurs en capacité de calcul. 
+
+```{r}
+library(parallel)
+library(doParallel)
+detectCores() # nombre de coeurs sur la machine
+cluster <- makeCluster(detectCores() - 1) # par convention on laisse un coeur pour l'OS
+registerDoParallel(cluster)
+```
+
+#### Apprentissage et tests des algorithmes 
+
+On va comparer les performances de plusieurs méthodes de classification sur la partition test, mais avant ça on doit procéder à l'apprentissage sur la partition train et dans la plupart des cas à l'optimisation des hyperparamètres par validation croisée. 
+
+L'idée de la validation croisée est de repartitionner l'ensemble d'apprentissage pour fixer au mieux un paramètre de la méthode (par exemple le nombre d'arbres dans une méthode d'agrégation d'arbres), on calcule donc plusieurs fois l'algorithme sur plusieurs ensembles de données et on le teste pour plusieurs valeurs du paramètres afin de choisir la valeur du paramètre pour laquelle l'indicateur de performance de l'algorithme est optimisé, cf annexes des slides pour un schéma de ce mécanisme). 
+
+On commence donc par spécifier le mode de validation croisée, ici on procède par de la 6-validation croisée (pour que les temps de calcul soient moins importants, en général on teste plutôt 5 à 10 plis).
+
+On précise un peu plus bas ce qu'on entend par indicateur de performance
+
+C'est aussi à cette étape qu'on précise que l'on peut utiliser plusieurs coeurs : option `allowParallel`.
+
+```{r}
+seeds <- c(lapply(1:6,function(x)1:5),3)
+# pour bien comprendre on va faire trouver 6-folds avec 5 paramètres de gridsearch sur 3 cores.
+objControl <- trainControl(method='cv', number=6, returnResamp='none', summaryFunction = prSummary, classProbs = TRUE, allowParallel = TRUE, seeds = seeds)
+```
+
+L'apprentissage se fait avec la fonction `train`, on précise la variable cible, les attributs, l'algorithme, la métrique de performance à optimiser (dans le cas binaire, l'aire sous la courbe ROC est un classique mais ici les classes sont déséquilibrées et on va préférer la F-mesure) et la grille de recherche de paramètres. 
+
+Pour chaque algorithme, on peut donc visualiser :
+
+- le résumé des résultats de l'apprentissage
+- le graphe du gridsearch qui est l'espace de test de l'hyperparamètre (notamment on peut réajuster la grille si les meilleurs résultats sont obtenus dans le coin du graphe)
+- la valeur du meilleur parametre `tune$bestTune`
+- a l'aide de ce dernier et du modèle correspondant `tune$finalModel`, on peut produire les prédictions sur l'echantillon test au format label ou probabilité
+- la matrice de confusion qui est la table de contingence entre valeurs réelles et prédites
+
+
+**CART**
+
+Pour l'algorithme CART qui est un simple arbre de décision, on considère la méthode `rpart`. En fonction des modèles, ce ne seront pas les mêmes hyperparametres donc il faudra personnaliser la grille. Les paramètres disponibles pour le tuning (ou calibrage) sont disponibles ici http://topepo.github.io/caret/available-models.html
+
+Ici cp est un critère de complexite lié à l'élagage, cp est en quelque sorte le coût de réaliser une nouvelle division qu'il faut compenser en gain de performance.
+
+```{r}
+gridsearch <- expand.grid(cp=seq(0, 0.1, 0.025)) #
+tune <- train(data.train,ytrain,method = "rpart",tuneGrid=gridsearch, trControl =objControl,metric='F')
+tune
+plot(tune) # attention on cherche ici à maximiser
+tune$bestTune
+
+```
+
+On peut évaluer la performance du modèle indifféremment du choix du seuil de décision (seuil tel prediction > seuil => "economie"). Cette métrique est l'aire sous la courbe ROC.
+```{r}
+pred <- predict(object=tune$finalModel, data.test,type='class')
+pred_prob <- predict(object=tune$finalModel, data.test,type='prob')[,"economie"]
+head(pred)
+conf.mat <- confusionMatrix(pred, ytest)
+verification::roc.plot(x=1*(as.character(ytest)=="economie"),pred=pred_prob)
+verification::roc.area(obs = 1*(as.character(ytest)=="economie"),pred=pred_prob)
+```
+
+Manifestement l'élagage fait perdre en performance.
+
+```{r}
+library(ggplot2)
+library(plotly)
+names(tune$results)
+g <- ggplot(data=tune$results,aes(x=F,y=AUC,label=cp)) +
+  geom_point()+geom_text()
+ggplotly(g)
+```
+
+
+
+On aime bien représenter graphiquement la matrice de confusion, mais il ne semble pas y avoir de fonction dédiée dans `caret`, on crée une fonction à cet effet qui semble un peu complexe mais qui a juste la vocation de restituer les matrices de confusion de manière plus esthétique, attention on choisit de restituer des pourcentages (si vous voulez le nombre d'observations, modifier en conséquence la ligne 4) :
+
+```{r}
+library(reshape2)
+library(ggplot2)
+cm.plot <- function(table_cm){
+tablecm <- round(t(t(table_cm) / colSums(as.matrix(table_cm))*100)) # crée les pourcentages
+tablemelt <- melt(tablecm)
+ggplot(tablemelt, aes(Reference, Prediction)) +
+geom_point(aes(size = value, color=value), alpha=0.8, show.legend=FALSE) +
+geom_text(aes(label = value), color="white") +
+scale_size(range = c(5,25)) +
+scale_y_discrete(limits = rev(levels(tablemelt$Prediction)))+
+theme_bw()
+}
+```
+
+
+
+On bon modèle présentera des coefficients élevés sur la diagonale et faibles ailleurs. Ici on a normalisé pour faciliter la lecture, du coup les coefficients sont les proportions de la classe X prédites comme Y.
+
+```{r}
+cm.plot(conf.mat$table)
+```
+
+
+
+On peut explorer les résultats très détaillés à partir de cette matrice : 
+
+```{r}
+conf.mat$overall
+conf.mat$byClass
+```
+
+En général on regarde le rappel (taux d'articles liés à l'économie bien identifiés, on retrouve ce nombre dans la matrice de confusion), on voit qu'il est très moyen, et la précision, taux d'articles prédits comme étant liés à l'économie et l'étant effectivement, qui est également mauvaise. En dessous de 90%, il est difficile de considérer un algorithme de machine learning performant. La F-mesure est faible également (0.5)
+
+On peut également afficher les variables qui ont le plus contribué à la construction de l'arbre.
+
+```{r}
+imp <- varImp(tune$finalModel)
+impdf <- data.frame(names = row.names(imp), imp = imp[,1])
+impdf <- impdf[order(impdf$imp, decreasing = TRUE),]
+names(impdf)[2]<-colnames(imp)[1]
+impdf[1:30,]
+```
+
+On peut représenter l'arbre 
+
+```{r}
+library(rpart.plot) 
+rpart.plot(tune$finalModel)
+```
+
+
+On va produire les mêmes sorties pour les 2 autres algorithmes classiques, attention, on change `gridsearch` et `method` à chaque fois.
+
+
+**Forêts aléatoires**
+
+Pour les forêts aléatoires on peut jouer sur `mtry` si on le souhaite, le nombre de variables sélectionnées comme candidates potentielles pour chaque embranchement. 
+
+La méthode `rf` testée ici est la version proche de CART.
+
+Avec le package `randomForest` les temps de calcul sont très longs, il vaut mieux utiliser le package `ranger`, mais il est important d'en faire l'expérience pour s'en convaincre.
+
+```{r}
+library(randomForest)
+gridsearch <- expand.grid(mtry = seq(30,250,50))
+tune <- train(data.train,ytrain,method = "rf",tuneGrid=gridsearch, trControl =objControl,metric='F')
+tune
+plot(tune)
+tune$bestTune
+pred <- predict(object=tune$finalModel, data.test,type='class')
+pred_prob <- predict(object=tune$finalModel, data.test,type='prob')[,"economie"]
+head(pred)
+conf.mat <- confusionMatrix(pred, ytest)
+verification::roc.plot(x=1*(as.character(ytest)=="economie"),pred=pred_prob)
+verification::roc.area(obs = 1*(as.character(ytest)=="economie"),pred=pred_prob)
+
+```
+
+
+Trade-off entre tx de faux négatifs et faux positifs ie erreurs de 1ère et 2ème espèce.
+
+```{r}
+ytest_bool=ytest=="economie"
+min_pred=min(pred_prob);max_pred=max(pred_prob);
+seuils=seq(min_pred,max_pred,by = (max_pred-min_pred)/100)
+# seuil=seuils[1]
+tx_erreurs=function(seuil){
+  pred_class=pred_prob>seuil
+  tx_faux_pos=sum(pred_class*!ytest_bool)/length(pred_class)
+  tx_faux_neg=sum((1-pred_class)*ytest_bool)/length(pred_class)
+  c(tx_faux_pos,tx_faux_neg)
+}
+
+library(data.table)
+couples_erreurs=data.table(t(sapply(seuils,tx_erreurs)))
+names(couples_erreurs) <- c("tx_faux_pos","tx_faux_neg")
+couples_erreurs$seuils=seuils
+
+g <- ggplot(data=couples_erreurs,aes(y=tx_faux_pos,x=tx_faux_neg,label=seuils))+geom_point()+geom_line()
+library(plotly)
+ggplotly(g)
+
+```
+
+
+
+
+```{r}
+cm.plot(conf.mat$table)
+conf.mat$overall
+conf.mat$byClass
+
+imp <- varImp(tune$finalModel)
+impdf <- data.frame(names = row.names(imp), imp = imp[,1])
+impdf <- impdf[order(impdf$imp, decreasing = TRUE),]
+names(impdf)[2]<-colnames(imp)[1]
+impdf[1:30,]
+
+```
+
+Regarder la valeur `mtry` recommandée par la littérature (racine du nombre de variables)
+On remarque que ça n'a pas beaucoup d'impact
+
+On voit dans la matrice de confusion que la F-mesure est meilleure mais reste contenue, à 0.69
+
+
+**Régression logistique**
+
+Difficile de ne pas tester une régression logistique comme benchmark ! En grande dimension, on la pénalise. La vignette pour rappel de l'utilisation de glmnet  https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html, alpha = 1 caractériste le lasso (sinon c'est une pénalité elasticnet combinant lasso et ridge, ie une combinaison de la pénalité fondée sur la norme L1 et celle fondée sur la norme L2). Lambda mesure l'importance de la pénalité. On rappelle que l'idée est que plus on pénalise et plus on force des coefficients à s'annuler et donc plus on obtient un modèle parcimonieux et a priori plus robuste (moins sensible au surapprentissage).
+
+Attention pour `glmnet`, les données doivent être au format matriciel, et le `predict` prend directement en argument `train`
+
+```{r}
+library(glmnet)
+gridsearch <- expand.grid(alpha=c(0, .1, .2), lambda=c(.1, .2, .3))
+tune <- train(as.matrix(data.train),ytrain,method = "glmnet",tuneGrid=gridsearch, family='binomial', trControl =objControl,metric='F')
+tune
+plot(tune)
+tune$bestTune
+pred <- predict(object=tune, as.matrix(data.test),type='raw')
+pred_prob <- predict(object=tune, as.matrix(data.test),type='prob')[,"economie"]
+head(pred)
+conf.mat <- confusionMatrix(pred, ytest)
+verification::roc.plot(x=1*(as.character(ytest)=="economie"),pred=pred_prob)
+verification::roc.area(obs = 1*(as.character(ytest)=="economie"),pred=pred_prob)
+```
+
+
+```{r}
+cm.plot(conf.mat$table)
+conf.mat$overall
+conf.mat$byClass
+imp <- abs(coef(tune$finalModel,tune$bestTune$lambda))
+impdf <- data.frame(names = row.names(imp), imp = imp[,1])
+impdf <- impdf[order(impdf$imp, decreasing = TRUE),]
+impdf[1:30,]
+```
+
+La F-mesure est de 0.75
+
+#### Reechantillonnage 
+
+Compte-tenu du déséquilibre des classes, la stratégie classique consiste à resampler, ie rééquilibrer artificiellement les classes (on utilise l'argument `sampling` qui peut prendre plusieurs valeurs). 
+
+```{r}
+objControl <- trainControl(method='cv', number=3, returnResamp='none', summaryFunction = prSummary, classProbs = TRUE, allowParallel = TRUE, seeds = seeds, sampling = 'up')
+
+gridsearch <- expand.grid(alpha=c(0, .1, .2), lambda=c(.1, .2, .3))
+tune <- train(as.matrix(data.train),ytrain,method = "glmnet",tuneGrid=gridsearch, family='binomial', trControl =objControl,metric='F')
+tune
+plot(tune)
+tune$bestTune
+pred <- predict(object=tune, as.matrix(data.test),type='raw')
+pred_prob <- predict(object=tune, as.matrix(data.test),type='prob')[,"economie"]
+head(pred)
+conf.mat <- confusionMatrix(pred, ytest)
+verification::roc.plot(x=1*(as.character(ytest)=="economie"),pred=pred_prob)
+verification::roc.area(obs = 1*(as.character(ytest)=="economie"),pred=pred_prob)
+```
+
+
+```{r}
+cm.plot(conf.mat$table)
+conf.mat$overall
+conf.mat$byClass
+```
+
+La F-mesure passe à 0.81 
+
+
+```{r}
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+#### Remarques
+
+On pourrait également tester l'impact de la pondération choisie, ici tfidf, l'impact du stemming, rajouter la prise en compte de bigrammes/trigrammes (combinaison de mots), tester des techniques de réduction de la dimension, du réechantillonnage ... 
+
+Pour des questions de temps de calcul, on a choisi des grilles de recherche très peu précises et des échantillons très petits, ce qui explique les performances médiocres ! 
+
+
+
+
+<!-- #### fastText -->
+
+<!-- Et si on essayait d'utiliser fastText ? -->
+
+<!-- ```{r eval=F, echo=F} -->
+<!-- library(fastrtext) -->
+
+<!-- tmp_file_model <- tempfile() -->
+
+<!-- train_labels <- paste0("__label__", data[,"class.text"]) -->
+<!-- train_texts <- tolower(train_sentences[,"text"]) -->
+<!-- train_to_write <- paste(train_labels, train_texts) -->
+<!-- train_tmp_file_txt <- tempfile() -->
+<!-- writeLines(text = train_to_write, con = train_tmp_file_txt) -->
+
+<!-- test_labels <- paste0("__label__", test_sentences[,"class.text"]) -->
+<!-- test_labels_without_prefix <- test_sentences[,"class.text"] -->
+<!-- test_texts <- tolower(test_sentences[,"text"]) -->
+<!-- test_to_write <- paste(test_labels, test_texts) -->
+
+<!-- # learn model -->
+<!-- execute(commands = c("supervised", "-input", train_tmp_file_txt, "-output", tmp_file_model, "-dim", 20, "-lr", 1, "-epoch", 20, "-wordNgrams", 2, "-verbose", 1)) -->
+<!-- ``` -->
+
+
+### Classification non supervisée
+
+Au lieu de classer les articles en utilisant les catégories, regardons comment ils se regroupent si on ne fixe pas d'*a priori*. 
+
+#### K-means
+
+Les k-means sont probablement l'algorithme le plus utilisé en classification non supervisée, on va utiliser ici une variante : les kmeans sphériques (car les kmeans reposent sur la norme euclidienne ce qui n'est pas pertinente si la matrice est très sparse, ce qui est en particulier une caractéristique des données textuelles).
+
+Ici on doit choisir si on veut étudier les regroupements de mots ou de documents. 
+
+Commençons par étudier les regroupements de mots (ils sont regroupés s'ils sont utilisés dans les mêmes articles). On utilise alors la matrice terme document (transposée de la matrice document terme)
+
+```{r}
+library(skmeans)
+tdm <-TermDocumentMatrix(documents) #rq on peut aussi changer la pondération pour toutes ces méthodes et regarder l'impact, par exemple pour la pondération tfidf, on rajoute l'argument weighting=weightTfIdf
+dim(tdm)
+tdmss <- removeSparseTerms(tdm, 0.99) #on retire les mots les plus rares pour réduire un peu la dimension, ie ceux qui apparaissent dans moins d'1% des documents.   
+dim(tdmss)
+start_time=Sys.time()
+sk <- skmeans(x=tdmss, 6) # on a choisi de voir ce qui ressortait pour 6 classes (pour voir si on retrouve les 6 thèmes utilisés pour classer les articles)
+## proportion par classe:
+print(paste("skmeans tourne en ",round(difftime(Sys.time(),start_time,units="secs"),1),"secondes"))
+table(sk$cluster)/sum(table(sk$cluster))
+for (i in 1:6){
+  print(paste('cluster ',i,sep=' '))
+  print(names(sk$cluster)[sk$cluster==i][1:50])
+  print('---------------')
+  }
+```
+
+##### Validation des clusters sur les catégories économie vs autre.
+
+Les prototypes donnent les coordonnées des barycentres de clusters dans l'espace des articles. On peut voir ça comme une projection !
+Visions duale : voyons ces projections comme des probabilités d'affectation d'un article à un cluster.
+```{r}
+cluster_word=sk$cluster
+doc_cluster=t(sk$prototypes)
+target=data$category=="economie"
+apply(doc_cluster,2,function(x)sum(x*target)/sum(x))# pondération par la proba
+table(apply(doc_cluster,1,which.max),target) # tirage du cluster "favori"
+```
+
+
+
+On peut afficher les mots par cluster, mais ce n'est pas forcément évident d'en tirer du sens si on a beaucoup de mots de vocabulaire comme c'est le cas ici. Il faut bien voir que quelle que soit la méthode retenue pour le clustering, un gros travail manuel d'interprétation sera nécessaire ensuite pour en tirer du sens.
+
+Considérons alors les regroupements de documents (en fonction de s'ils utilisent les mêmes mots). Un peu comme on a cherché à le faire avec la classification supervisée mais sans a priori sur les catégories de rangement. Réappliquons les skmeans mais sur la matrice document terme cette fois, on classe donc bien les documents et non plus les mots, mais en revanche on peut ensuite produire les nuages de mots par groupe de documents (ce qui peut aider à comprendre les regroupements d'articles en visualisant les mots les plus fréquents).
+
+(rq pour les wordclouds, ça peut valoir le coup d'utiliser stemCompletion (cf début td) pour avoir de plus jolis wordcloud, ici les mots sont racinisés)
+
+```{r, warning=FALSE}
+dtm <-DocumentTermMatrix(documents)
+dim(dtm)
+dtmss <- removeSparseTerms(dtm, 0.99)   
+dtmss <- dtmss[rowSums(as.matrix(dtmss))>0,]
+dim(dtmss)
+library(skmeans)
+## On partitionne en 6 clusters.
+sk <- skmeans(x=dtmss, 6)
+## On regarde la répartition dans les clusters
+table(sk$cluster)/sum(table(sk$cluster))
+
+dtmss_m <- as.matrix(dtmss)
+for (i in 1:6){
+  m <- dtmss_m[sk$cluster==i,]
+  wordsFreq <- sort(colSums(m),decreasing = TRUE)
+  wordsFreq <- data.frame(word = names(wordsFreq), Freq = as.vector(wordsFreq)) # mise au format pour wordcloud2
+  print(wordcloud2(data = wordsFreq[1:500,],minSize = 1, size = 3))}
+ 
+  #d <- data.frame(freq = sort(colSums(m),decreasing=TRUE)) #frequence d'apparition des mots
+  #wordcloud(words = rownames(d), freq = d$freq, min.freq = 1,max.words=500, random.order=FALSE, rot.per=0.35, colors=brewer.pal(8, "Dark2"),scale = c(7, 0.1),vfont=c("serif","plain"))}
+```
+
+On peut voir qu'on ne retrouve pas du tout les catégories initiales, mais plutôt des sujets qui ont suscité beaucoup de réactions ou de débat. Il faudrait également optimiser le nombre de topics, ce que nous n'avons pas cherché à faire ici. 
+
+
+#### Classification ascendante hiérarchique
+
+Testons la CAH sur les mêmes observations, c'est tout de même un peu long car on calcule une grosse matrice de distances (on choisit la similarité cosinus comme distance entre mot puisqu'on est sur du texte ici donc une matrice très sparse pour laquelle la norme euclidienne n'aurait pas grand sens)
+
+```{r, warning=FALSE}
+library(cluster)  
+library(proxy)
+d <- dist(dtmss_m, method="cosine")   #attention quand dist vient de proxy, elle veut une matrice en argument
+fit <- hclust(d=d, method="ward.D")   
+fit  
+plot(fit, hang=-1)
+groups <- cutree(fit, k=6)   # "k=" defines the number of clusters you are using   
+rect.hclust(fit, k=10, border="red")
+table(groups)
+
+for (i in 1:6){
+  m <- dtmss_m[groups==i,]
+  wordsFreq <- sort(colSums(m),decreasing = TRUE)
+  wordsFreq <- data.frame(word = names(wordsFreq), Freq = as.vector(wordsFreq)) # mise au format pour wordcloud2
+  print(wordcloud2(data = wordsFreq[1:500,],minSize = 1, size = 3))}
+
+  #d <- data.frame(freq = sort(colSums(m),decreasing=TRUE)) #frequence d'apparition des mots 
+  #wordcloud(words = rownames(d), freq = d$freq, min.freq = 1,max.words=500, random.order=FALSE, rot.per=0.35, colors=brewer.pal(8, "Dark2"),scale = c(7, 0.1),vfont=c("serif","plain"))}
+
+```
+
+Différentes méthodes de clustering ne fournissent pas les mêmes résultats...
+
+```{r}
+doc_cah=data.frame(cluster=groups,target=target)
+library(dplyr)
+doc_cah%>%group_by(cluster)%>%
+  summarise(taille_cluster=n(),
+            nb_doc_eco=sum(target),
+            freq_doc_eco=mean(target))
+```
+
+
+#### Topic Modelling : LDA
+
+On va regarder à présent les résultats d'une [LDA](https://fr.wikipedia.org/wiki/Allocation_de_Dirichlet_latente), l'intérêt c'est que l'on regroupe les documents et les mot simultanément cette fois et que cela permet une exploration de résultats beaucoup plus aisée. La première chose à faire est de vérifier que l'on n'a pas de documents sans mot (notamment après avoir filtré sur la sparsité/parcimonie).
+
+La LDA s'applique sur une matrice documents termes sans pondération (nombre d'occurrences).
+
+```{r}
+rowTotals <- apply(dtmss , 1, sum) # calcule la somme des termes dans chaque document
+dtmss   <- dtmss[rowTotals> 0, ] # retire les documents vides, il peut arriver après nettoyage de se retrouver avec des documents vides, par exemple si on travaille sur des documents très courts type tweet
+dim(dtmss)
+```
+
+La LDA est estimée par [Gibbs sampling](https://fr.wikipedia.org/wiki/%C3%89chantillonnage_de_Gibbs), il faut fixer un certain nombre de paramètres
+
+```{r}
+library(topicmodels)
+# Paramètres du Gibbs sampling
+burnin <- 500
+iter <- 500
+thin <- 100
+seed <- list(2003,5,63,100001,765) # arbitraire
+nstart <- 5
+best <- TRUE
+
+# Nombre de thèmes
+k <- 10 # arbitraire à ce stade, nécessiterait d'être optimisé
+
+dtm2 <- DocumentTermMatrix(documents, control=list(dictionary = minfreq, weighting=weightTf ))
+dtmss <- removeSparseTerms(dtm2, 0.99)
+dtmss <- dtmss[rowSums(as.matrix(dtmss))>0,]
+
+# Estimation de la LDA
+ldaOut <-LDA(dtmss,k, method="Gibbs", control=list(nstart=nstart, seed = seed, best=best, burnin = burnin, iter = iter, thin=thin))
+```
+
+L'estimation peut s'avérer un peu longue 
+
+On peut désormais explorer les résultats 
+
+```{r}
+ldaOut.topics <- as.matrix(topics(ldaOut))
+table(ldaOut.topics)
+```
+
+Les mots les plus discriminants pour les topics (ici on en prend 5 arbitrairement) :
+
+```{r}
+ldaOut.terms <- as.matrix(terms(ldaOut,5))
+ldaOut.terms
+```
+
+On peut vouloir regarder la distribution des topics dans les documents. Pour labéliser les topics, on concatène les 5 top words.
+
+```{r}
+topicProbabilities <- as.data.frame(ldaOut@gamma)
+
+names(topicProbabilities) <- apply(data.frame(ldaOut.terms),2,function(x) paste(x,collapse=' '))
+topicProbabilities[1:10,]  #pour les dix premiers documents arbitrairement, on voit que la plupart du temps un topic est prépondérant.
+```
+
+Il faudrait bien sûr y passer un peu plus de temps pour en extraire une information intéressante, mais ça peut permettre de récupérer le ou les thèmes principaux de chaque document par exemple.
+
+Pour explorer les topics de façon plus globale et intéractive, un package très intéressant `LDAvis` 
+La subtilité c'est qu'il a besoin du corpus en plus de la sortie de la LDA précédente, donc on doit filtrer le corpus pour ne garder que les documents qui ont effectivement servi.
+
+```{r}
+#pour ldavis
+indices <- rownames(as.matrix(dtmss))
+documents_ <- Corpus(VectorSource(data$content[indices]))
+```
+
+La fonction suivante met les données au format souhaité pour la visualisation.
+Si tout va bien votre navigateur devrait s'ouvrir... ATTENTION A DECOMMENTER LA DERNIERE LIGNE
+Des explications sur les différents paramètres sont données ici http://cpsievert.github.io/slides/LDA/0926/#/4
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(topicmodels)
+library(dplyr)
+library(stringi)
+library(tm)
+library(LDAvis)
+
+topicmodels_json_ldavis <- function(ldaOut, corpus, doc_term){
+    phi <- posterior(ldaOut)$terms %>% as.matrix
+    theta <- posterior(ldaOut)$topics %>% as.matrix
+    vocab <- colnames(phi)
+    doc_length <- vector()
+    for (i in 1:length(corpus)) {
+        temp <- paste(corpus[[i]]$content, collapse = ' ')
+        doc_length <- c(doc_length, stri_count(temp, regex = '\\S+'))
+    }
+    freq_matrix <- data.frame(ST = colnames(doc_term), Freq = colSums(as.matrix(doc_term)))
+
+    # Convertit en json
+    json_lda <- LDAvis::createJSON(phi = phi, theta = theta,
+                            vocab = vocab,
+                            doc.length = doc_length,
+                            term.frequency = freq_matrix$Freq)
+
+    return(json_lda)
+}
+
+json <-topicmodels_json_ldavis(ldaOut,documents_,dtmss)
+library(servr)
+```
+
+Pour afficher l'application interactive 
+
+```{r eval=F}
+serVis(json, out.dir = 'vis', open.browser = TRUE)
+```
+
+
+```{r}
+doc_lda_cluster=posterior(ldaOut)$topics
+# doc_lda_cluster=ldaOut@gamma
+apply(doc_lda_cluster,2,function(x)sum(x*target)/sum(x))
+```
+
+
+
+# Analyse textuelle : matching de chaines de caracteres 
+
+Le matching peut servir à merger des bases disposant chacune d'une colonne texte proche mais pas exactement comparable (exemple typique : des adresses). 
+
+## un exemple : similarité cosinus
+
+Dans ce premier exemple on cherche à coder les offres d'emploi récupérées sur le site du bon coin à l'aide d'une codification existante, par exemple la codification Rome des métiers. Pour cela on a un intitulé par offre, la colonne 'X.Offre.' mais il n'y a aucune raison pour qu'il matche exactement avec l'intitulé tel qu'il est donné dans la codification Rome officielle. 
+
+Dans ce cas là on harmonise les deux champs textes (intitulé du bon coin et intitulé Rome), et on va chercher ensuite par similarité cosinus l'intitulé Rome matchant le mieux l'intitulé du bon coin.
+
+Certaines opérations prennent du temps, montrons le seulement sur un échantillon.
+
+```{r}
+data <- read.csv('data_text_mining/data_formation_tm_jobs.csv', sep="|",quote="",header=TRUE, nrows=6, encoding = "UTF-8")
+head(data)
+```
+
+
+On renomme le champ d'intérêt "offre". Jetons un oeil aux données
+
+```{r}
+names(data)[names(data)=="X.Offre."] <- "offre"
+data$offre[1:2]
+dim(data)
+```
+
+On charge également la codification Rome, le libellé que l'on cherche à matcher est la colonne "libelle_rome"
+
+```{r}
+rome <- read.table('data_text_mining/rome_fap_ameliore.csv',sep=',',header=TRUE, stringsAsFactors =FALSE)
+rome$libelle_rome[1:2]
+dim(rome) #11609
+```
+
+Pour vectoriser les 2 champs tout en utilisant les mêmes dictionnaires/vocabulaires, on les concatène simplement. En gros on fait un même corpus avec les corpus initiaux.
+
+```{r}
+docs <- c(rome$libelle_rome,as.character(data$offre))
+```
+
+La suite vous connaissez...
+
+```{r}
+library(stringi)
+library(stringr)
+library('SnowballC')
+documents <- Corpus(VectorSource(docs))
+documents <- tm_map(documents, content_transformer(tolower))
+documents <- tm_map(documents, content_transformer(gsub), pattern = "<br>", replacement = " ")
+accent <- function(x) stri_trans_general(x, "Latin-ASCII")
+documents <- tm_map(documents, content_transformer(accent))
+documents <- tm_map(documents, content_transformer(gsub), pattern = "\\([^\\)]+\\)", replacement = " ")
+documents <- tm_map(documents, content_transformer(gsub), pattern = "[^a-zA-Z]", replacement = " ")
+stopwords_fr = c(stopwords("french"),'a','h','euros','lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche')
+stopwords_fr = setdiff(stopwords_fr, c("pas"))
+documents <- tm_map(documents, removeWords, stopwords_fr)
+lapply(documents[1:2],as.character)
+documents <- tm_map(documents, stripWhitespace) #n'enleve pas le tout premier espace
+documents <- tm_map(documents, content_transformer(gsub), pattern = "^\\s+", replacement = "")
+#documents <- tm_map(documents, PlainTextDocument)  # needs to come before stemming
+documents <- tm_map(documents, stemDocument, "french")
+lapply(documents[1:2],as.character)
+tdm.mat <- as.matrix(TermDocumentMatrix(documents))
+```
+
+On utilise la similarité cosinus pour comparer les intitulés une fois vectorisés (cette distance est classique pour le texte). Elle est par exemple implémentée dans la librairie `lsa`
+On définit une fonction `match` qui va calculer pour chaque libelle rome, la similarité avec le libellé numéro `i` de la matrice (et issu de la base du bon coin), on retient celui qui maximise la similarité et on crée une nouvelle colonne dans les données.
+
+```{r}
+library(lsa)
+match <- function(i){
+temp<-sapply(1:nrow(rome),function(j) cosine(tdm.mat[,j],tdm.mat[,nrow(rome)+i]))
+return(rome$libelle_rome[which.max(temp)])}
+```
+
+Ca semble marcher un peu ! ... mais pas toujours 
+
+```{r}
+data$libelle_rome <- sapply(1:nrow(data), function(i) match(i))
+head(data[,c('offre','libelle_rome')])
+```
+
+
+
+## un deuxieme exemple : la distance de Darau Levenshtein
+
+Cet exemple est proche du précédent, il permet de montrer que ce genre de manipulation peut permettre de merger sur des noms de communes par exemple. Et comment on peut utiliser la distance de Levenshtein.
+
+```{r}
+data <- read.csv('data_text_mining/data_formation_tm_jobs.csv', sep="|",quote="",header=TRUE, encoding = "UTF-8")
+head(data)
+
+names(data)[names(data)=="X.Ville."] <- "commune"
+data$commune[1:2]
+dim(data)
+data<-data['commune']
+head(data)
+```
+
+Le nom de commune comprend le nom et le code postal, nous devons séparer les deux. On part du principe qu'il n'y a qu'un seul espace pas simplicité mais en réalité, cela vaudrait le coup d'être vérifier ! Il y a peut-être un petit travail supplémentaire pour les noms avec article, mais cela dépasse le cadre de cet exercice.
+
+```{r}
+data$nom_commune <- sapply(data$commune, function(x) strsplit(as.character(x)," ")[[1]][1])
+data$codes_postaux <- sapply(data$commune, function(x) strsplit(as.character(x)," ")[[1]][2])
+library(stringr)
+data$codes_postaux <- sapply(data$codes_postaux, function(x) str_replace_all(x, '"',''))
+```
+
+On charge un jeu de données avec les géolocalisations des communes, issu de data.gouv.fr
+
+```{r}
+communes <- read.csv('data_text_mining/commune_loc_datagouv.csv',encoding ='UTF-8',stringsAsFactors =FALSE)
+communes <- unique(communes[,c('nom_commune','codes_postaux','latitude','longitude')])
+```
+
+A ce stade on peut tenter de fusionner les deux bases...
+
+```{r}
+# a ce stade on pourrait tester un merge, on sent bien que ça va pas trop marcher
+data_ <- merge(data,communes,by=c('nom_commune','codes_postaux'))
+dim(data)
+dim(data_) # échec !
+```
+
+On harmonise les deux champs communes 
+
+```{r}
+library(stringi)
+clean_string <- function(string){
+    # Lowercase
+    temp <- tolower(string)
+    temp <- stri_trans_general(temp, "Latin-ASCII")
+    temp <- str_replace_all(temp,"[^a-zA-Z]", " ") #nombres et ponctu espaces
+    temp <- str_replace_all(temp, "[\\s]+","")
+    return(temp)
+}
+
+data$clean_commune <- sapply(data$nom_commune, function(string) clean_string(string))
+data$clean_commune[1:2]
+communes$clean_commune <- sapply(communes$nom_commune, function(string) clean_string(string))
+communes$clean_commune[1:2]
+```
+
+Cette fois-ci, on retente le merge 
+
+```{r}
+data_ <- merge(data,communes,by=c('clean_commune','codes_postaux'))
+dim(data)
+dim(data_) # déjà bien mieux !
+```
+
+Repérons les cas où les communes du bon coin ne sont pas trouvées dans datagouv (on passe outre les problèmes de codes postaux ici, d'où la distinction entre missed et reallymissed)
+
+```{r}
+data_ <- merge(data,communes,by=c('clean_commune','codes_postaux'),all.x=TRUE) #on force le merge
+dim(data_)
+missed <- unique(data_$clean_commune[is.na(data_$latitude)]) #les communes du bon coin qui n'ont pas trouvé d'équivalent dans le fichier data.gouv, n'ont pas de géoloc
+length(missed)
+reallymissed <- missed[sapply(missed, function(i) length(grep(i,communes$clean_commune))==0)] #mais pour certaines c'est un autre pb, la commune correspond bien mais pas le code postal, c'est pour ça que le merge n'a pas fonctionné, on les retire
+reallymissed # les communes qui ne trouvent finalement pas d'equivalent dans data.gouv
+```
+
+La fonction `grep` est intéressante à connaître, elle cherche notamment si une chaîne de caractère en contient une autre et le cas échéant retourne la position dans un tableau de chaînes.
+
+```{r}
+communes$clean_commune[grep("paris",communes$clean_commune)]
+```
+
+Pour les communes du bon coin qui ne matchent pas, on va regarder celles du fichier data.gouv qui sont les plus proches au sens de la distance de Damerau Levenshtein (nombre d'éditions pour passer de l'une chaine de caractère à l'autre, l'inversion comptant pour une édition), attention ça met un peu de temps à tourner ! 
+
+La distance en question est repérée par la méthode `dl` de la fonction `stringdist` de la librairie `stringdist`. On donne un exemple bateau sur "ca" et "abc".
+La fonction `paste` sert juste à concaténer des chaines de caractères pour afficher la commune du bon coin, la commune data.gouv la plus proche, et la distance correspondante.
+
+```{r}
+library(stringdist)
+stringdist("ca","abc",method="dl")
+levenshtein_prop <- function(com){
+temp<-sapply(communes$clean_commune,function(i) stringdist(i,com,method='dl'))
+return(paste(c(com, communes$clean_commune[which.min(temp)],as.character(min(temp))),collapse="  "))}
+lapply(reallymissed, levenshtein_prop)
+```
+
+On voit que dans certains cas, le merge a raté à cause de l'existence d'un article "Saint Aubin De Baubigné" vs "Saint Aubin Baubigné"
+Bon cet exemple n'est pas le plus utile à cause des nouvelles, anciennes communes etc... mais ça permet d'illustrer l'usage de ce genre de fonctionnalités.
+
+
+
+
+
+# Un peu d'analyse sémantique 
+
+
+## Petit exemple autour de l'analyse de sentiment et des dictionnaires annotés 
+
+L'approche classique consiste à utiliser un dictionnaire annoté. On va regarder ce que ça donne sur un échantillon des articles scrapés sur le site du Monde. Ils sont déjà nettoyés cette fois-ci. L'idée est de produire un indicateur de sentiment (très frustre) et de regarder son évolution dans le temps.
+
+```{r}
+lemonde <- read.table('data_text_mining/lemonde_formation_tm.csv',header=TRUE) 
+head(lemonde)
+```
+On va avoir besoin d'une variable année 
+
+```{r}
+lemonde$annee <- sapply(lemonde$date, function(x) substr(as.character(x),1,4))
+```
+
+On charge aussi un dictionnaire annoté manuellement (il s'agit d'un extrait ici, c'est pourquoi il n'y a que de mots positifs en réalité)
+
+```{r}
+dico <- read.table('data_text_mining/dico_formation_tm.csv',header =TRUE)
+head(dico)
+```
+
+On le scinde en 2 listes de mots respectivement positifs et négatifs 
+
+```{r}
+positive_words <- dico[dico$SO=='POSITIVE','keyword']
+negative_words <- dico[dico$SO=='NEGATIVE','keyword']
+```
+
+Il ne reste plus qu'à compter, pour chaque article le nombre de mots présents dans la liste des mots positifs, moins le nombre de mots présents dans la liste des mots négatifs et on normalise par le nombre de mots total.
+
+```{r}
+count_word <- function(x,lexicon_pos,lexicon_neg){
+	txt <- as.character(x)
+	words <- strsplit(txt," ")[[1]]
+	return((sum(words %in% lexicon_pos)-sum(words %in% lexicon_neg))/length(words))}
+
+lemonde$so <- sapply(lemonde$content,function(txt) count_word(txt,positive_words,negative_words))
+mean(lemonde$so)
+```
+
+On moyenne par année pour avoir un indicateur lissé. "So" signifie sentiment orientation.
+
+```{r}
+aggdata <-aggregate(lemonde$so, by=list(lemonde$annee),FUN=mean, na.rm=TRUE)
+names(aggdata)<-c('date','so')
+```
+
+On va comparer avec l'indice de climat des affaires pour la France, calculé par l'insee. Cet indice est mensuel, on le moyenne aussi à l'année (évidemment tout cela mériterait d'être fait de façon bien plus fine mais pour l'exercice on travaille sur un petit échantillon d'articles) 
+
+```{r}
+climat <- read.table('data_text_mining/business_climate.csv',header=TRUE,sep=';')
+climat$annee <- sapply(climat$date,function(x) substr(as.character(x),1,4))
+head(climat)
+
+climat <-aggregate(climat$business_climate, by=list(climat$annee),FUN=mean, na.rm=TRUE)
+names(climat)<-c('date','business_climate')
+```
+On fusionne les deux bases et on trace le graphique 
+
+```{r}
+aggdata <- merge(aggdata,climat[,c('date','business_climate')],by='date')
+```
+
+```{r}
+label <- aggdata$date
+aggdata$x <- 1:nrow(aggdata)
+
+par(mar = c(5,5,2,5))
+with(aggdata, plot(x, business_climate, type="l", col="red3", 
+             ylab='climat',
+             ylim=c(70,115)))
+par(new = T)
+with(aggdata, plot(x, so, type='l',col='black', axes=F, xlab=NA, ylab=NA, cex=1.2))
+axis(1,at=1:length(label),labels=label)
+axis(side = 4)
+mtext(side = 4, line = 3, 'Number genes selected')
+legend("topleft",
+       legend=c('climat', "so"),
+       lty=c(1,1), col=c("red3", "black"))
+axis(1,at=1:length(label),labels=label)
+```
+
+On retrouve des évolutions "relativement" similaires !
+
+
+
+## Word2vec & GloVe
+
+Certains chercheurs mettent à disposition des modèles word2vec, GloVe, LSA qui peuvent être considérés comme des tables de correspondance entre des mots et un vecteur numérique dans un espace d'une certaine taille (en générale très inférieure à la taille du vocabulaire qui est, on le rappelle, grande). Cet espace est un espace "sémantique" en quelques sortes.  
+
+Glove, Word2vec et LSA produisent tous les 3 des vectorisations du langage ie des représentations dans un espace vectoriel réel de taille N (choisie)
+
+- word2vec : s'appuie sur un simple perceptron multi-couches (réseau de neurone) à une couche cachée (de taille N) où la tâche est de prédire le mot en fonction du contexte ou réciproquement. La vectorisation en dimension N est fournie par l'ensemble des poids des neurones de la couche cachée.
+- global vector : s'appuie sur la factorisation de la matrice de co-occurrence des termes.
+- LSA : s'appuie sur la décomposition en valeurs singulières de la matrice termes-documents.
+
+Cette tâche d'apprentissage considérable est souvent faite sur de très gros corpus (comme Wikipédia par exemple), et leur réutilisation à d'autres fins s'appelle le transfer learning.
+
+
+L'exemple développé ci-dessous s'appuie sur le tutoriel GloVe [text2vec](http://text2vec.org/glove.html)
+
+Un autre exemple avec word2vec, est situé en dessous du premier, pour illustrer un exemple de transfer learning.
+
+
+```{r eval=F}
+library(text2vec)
+text8_file = "data_text_mining/text8"
+# if (!file.exists(text8_file)) {
+#   download.file("http://mattmahoney.net/dc/text8.zip", "~/text8.zip")
+#   unzip ("~/text8.zip", files = "text8", exdir = "~/")
+# }
+wiki = readLines(text8_file, n = 1, warn = FALSE)
+```
+
+
+
+```{r eval=F}
+# tokenisation
+tokens = space_tokenizer(wiki)
+# creation d'un vocabulaire de 1-grammes
+it = itoken(tokens, progressbar = FALSE)
+vocab = create_vocabulary(it)
+# on supprime les n-grammes rares
+vocab = prune_vocabulary(vocab, term_count_min = 5L)
+vectorizer = vocab_vectorizer(vocab)
+# co-occurrence avec un contexte de taille 5
+tcm = create_tcm(it, vectorizer, skip_grams_window = 5L)
+```
+
+```{r, eval=F}
+glove = GlobalVectors$new(word_vectors_size = 50, vocabulary = vocab, x_max = 10)
+wv_main = glove$fit_transform(tcm, n_iter = 50, convergence_tol = 0.01)
+save(wv_main,glove,file="GloVe.RData")
+```
+
+
+```{r eval=F}
+load("GloVe.RData")
+dim(wv_main)
+wv_context = glove$components
+dim(wv_context)
+word_vectors = wv_main + t(wv_context)
+```
+
+
+Dans cet espace numérique, il a été montré que deux mots proches (au sens d'une distance mathématique donc) avaient des sens proches. C'est un énorme gain par rapport à l'approche bag of words où deux synonymes peuvent avoir une similarité apparente très faible du fait qu'ils sont rarement utilisés ensemble dans les mêmes documents (lorsque la similarité est calculée via les colonnes de la matrice documents termes typiquement).
+
+```{r eval=F}
+#calcul de la distance cosinus
+cos_sim = sim2(x = word_vectors, y = word_vectors["berlin", , drop = FALSE], method = "cosine", norm = "l2")
+```
+
+
+Termes les plus proches
+```{r eval=F}
+head(sort(cos_sim[,1], decreasing = TRUE), 10)
+```
+
+Termes diamétralement opposés
+```{r eval=F}
+tail(sort(cos_sim[,1], decreasing = TRUE), 10)
+```
+
+Termes décorrélés
+```{r eval=F}
+head(sort(abs(cos_sim[,1])), 10)
+```
+
+
+Les propriétés mathématiques et sémantiques de ces modèles en ont fait leur renommée :
+
+```{r eval=F}
+berlin = word_vectors["paris", , drop = FALSE] - 
+  word_vectors["france", , drop = FALSE] + 
+  word_vectors["germany", , drop = FALSE]
+cos_sim = sim2(x = word_vectors, y = berlin, method = "cosine", norm = "l2")
+```
+
+
+Termes les plus proches
+```{r eval=F}
+head(sort(cos_sim[,1], decreasing = TRUE), 10)
+```
+
+Termes diamétralement opposés
+```{r eval=F}
+tail(sort(cos_sim[,1], decreasing = TRUE), 10)
+```
+
+
+Termes décorrélés
+```{r eval=F}
+head(sort(abs(cos_sim[,1])), 10)
+```
+
+
+
+On peut représenter les mots graphiquement
+
+```{r, eval=F}
+words=c("money","finance","economy","cash","dollar","euro",
+        "data","mining","science","study","predictive","learning",
+        "country","city","town","house","place","home",
+        "english","french","language","german","travel","speak")
+topic=c(rep("economie",6),
+        rep("modélisation",6),
+        rep("lieu",6),
+        rep("langage",6))
+terms = word_vectors[words, , drop = FALSE] #on peut récupérer les mots les plus similaires à plusieurs références
+
+terms_df=data.frame(predict(prcomp(terms,rank. = 2)))
+terms_df$word=words
+terms_df$topic=topic
+
+g <- ggplot(terms_df,aes(x=PC1,y=PC2,label=word,color=topic))+geom_text()
+g
+library(plotly)
+p <- ggplotly(g)
+p
+htmlwidgets::saveWidget(as_widget(p),"PC1_PC2_glove.html")
+htmltools::includeHTML("PC1_PC2_glove.html")
+
+```
+
+
+
+
+L'exemple ci-dessous s'appuie sur un package github non pré-compilé, il vous faudra donc installer RTools pour le faire fonctionner.
+
+
+Attention pour l'installation, le package n'est pas sur CRAN
+```{r, eval=F}
+devtools::install_github("bmschmidt/wordVectors")
+```
+
+On charge le modèle, c'est un peu long...
+
+```{r, results='hide', message=FALSE, warning=FALSE, eval=F}
+library(wordVectors)
+library(magrittr)
+model = read.vectors("data_text_mining/frWac_non_lem_no_postag_no_phrase_200_cbow_cut100.bin")
+```
+
+
+```{r, eval=F}
+model %>% closest_to("economie") # montre les mots les plus proche de economie dans cet espace
+```
+
+Les propriétés mathématiques et sémantiques de ces modèles ont en fait leur renommée :
+
+```{r, eval=F}
+model %>% closest_to(~ "homme" - "il" + "elle")
+model %>% closest_to(~ "roi" - "il" + "elle")
+```
+
+(ok, on a un petit souci d'accent..)
+
+On peut représenter les mots graphiquement :
+
+```{r, eval=F}
+terms = closest_to(model,model[[c("croissance","rÃ©cession","chomage","impot")]],50) #on peut récupérer les mots les plus similaires à plusieurs références
+eco = model[[terms$word,average=F]] #average = FALSE, on prend la version numérique de chaque mot
+plot(eco,method="pca")
+
+```
+
+
+
+
